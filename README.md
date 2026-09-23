@@ -1,13 +1,67 @@
 # LFM Pulse Compression Radar Simulation with CFAR Target Detection
 
-C simulation + Python visualization pipeline for a linear-frequency-modulated
-(LFM/chirp) pulse-compression radar with adaptive CA-CFAR target detection.
-
 ![Detection Plot](radar_detection_plot.png)
 
-*Range profile after matched filtering (blue), the adaptive CA-CFAR threshold
-(red dashed), and detections (green) for four synthetic targets — including
-a closely-spaced pair (~1.5 km) and a weak target (~7.8 km).*
+## What this is
+
+I built this project to get hands-on with a core radar signal processing
+technique: pulse compression. I write the full pipeline in C — chirp
+generation, target/noise simulation, matched filtering, and adaptive
+detection — then visualize the results in Python.
+
+The idea I wanted to explore: real radars can't just blast out a short,
+high-power pulse to get good range resolution (the hardware can't handle
+the peak power). Instead, they transmit a long, low-power pulse whose
+frequency sweeps linearly over time — a chirp — and recover the resolution
+afterward with a matched filter. I wanted to actually implement that
+trade-off myself instead of just reading about it, and then layer on
+CFAR detection to see how a receiver decides "target" vs. "noise" without
+a human eyeballing a plot.
+
+## How I built it
+
+**1. Chirp generation.** I generate a linear-frequency-modulated (LFM)
+pulse, `s(t) = exp(jπKt²)` where `K = B/T`, using my configured pulse
+width `T` and bandwidth `B`.
+
+**2. Scene simulation.** I place a handful of synthetic targets at chosen
+ranges and amplitudes — including a closely-spaced pair and one weak
+target — delay each one's chirp copy by `2R/c` samples, sum them into a
+receive window, and add complex Gaussian noise to stand in for thermal
+noise.
+
+**3. Matched filtering (pulse compression).** I convolve the received
+signal with the time-reversed conjugate of my transmitted chirp. This is
+the step that collapses the long, spread-out chirp back into a narrow,
+high-SNR peak at each target's true range — the resolution after
+compression works out to `c / (2B)`.
+
+**4. CA-CFAR detection.** I implemented Cell-Averaging Constant False
+Alarm Rate detection: for every range bin, I average the power in a ring
+of surrounding training cells (skipping guard cells right next to the
+cell under test so a target's own sidelobes don't bias the estimate),
+then set an adaptive threshold `α × noise_estimate`, where `α` comes from
+the false-alarm probability I want. This was the part I found most
+interesting — a fixed threshold either misses weak targets or drowns in
+false alarms once the noise floor shifts, and CFAR sidesteps that by
+constantly re-estimating the local noise.
+
+**5. Visualization.** I pipe the C program's CSV output into a Python
+script that plots the matched-filter range profile, the CFAR threshold
+curve, and the resulting detections, so I can actually see the pipeline
+working end to end.
+
+## A bug I ran into (and why I think it's worth mentioning)
+
+My first version had target detections showing up about 1.5 km further
+out than where I'd actually placed the targets. It turned out my matched
+filter — implemented as a full convolution — has a built-in group delay
+of `Np - 1` samples: a target's compressed peak lands at
+`delay + (Np - 1)`, not at `delay`. I fixed the range calculation to
+account for that shift. It's a classic radar-sim gotcha, and I'm noting
+it here because I think working through *why* it happened taught me more
+about matched filtering than getting the numbers right on the first try
+would have.
 
 ## Build & run
 
@@ -17,71 +71,34 @@ gcc -O2 -Wall -o lfm_radar lfm_radar.c -lm
 python3 visualize.py radar_output.csv
 ```
 
-Requires `matplotlib` (`pip install matplotlib`).
+Needs `matplotlib` on the Python side (`pip install matplotlib`).
 
-Note: noise is randomized per run (`srand(time(NULL))`), so exact detection
-counts/positions near the weak target may vary slightly run to run. For a
-reproducible result to include in a report, change that line in `main()` to
-a fixed seed, e.g. `srand(42);`.
+Note: I seed the noise from `time(NULL)`, so detections near the weak
+target can flicker slightly between runs — that's expected CFAR behavior
+near threshold, not a bug. For a reproducible run I can point to in a
+report, I'd swap that for a fixed seed like `srand(42);`.
 
-## What it does
+## Parameters I used
 
-1. **Chirp generation** — builds an LFM pulse `s(t) = exp(jπKt²)`, `K = B/T`,
-   over the configured pulse width `T` and bandwidth `B`.
-2. **Scene simulation** — places synthetic targets at chosen ranges/amplitudes,
-   delays each target's chirp copy by `2R/c` samples, sums them, and adds
-   complex Gaussian noise.
-3. **Matched filtering (pulse compression)** — convolves the received signal
-   with the time-reversed conjugate of the chirp. This is the classic
-   matched filter, and it's what turns a long, low-power chirp into a narrow,
-   high-SNR peak at each target's range. Range resolution after compression
-   is `c / (2B)`.
-4. **CA-CFAR detection** — Cell-Averaging Constant False Alarm Rate: for each
-   range bin, average the power in surrounding training cells (skipping guard
-   cells adjacent to the cell under test) to get a local noise estimate, then
-   set the detection threshold to `α × noise_estimate`, where `α` is derived
-   from the desired probability of false alarm (`Pfa`). This keeps the false
-   alarm rate constant even as the noise floor varies across range — a fixed
-   threshold would either miss weak targets or flood you with false alarms.
-5. **CSV output → Python plot** — `visualize.py` plots the matched-filter
-   range profile, the CFAR threshold curve, and marks detections.
-
-## A subtlety worth knowing (and worth mentioning if asked about the project)
-
-The matched filter here is implemented as a **full convolution**
-(`y[k] = Σ rx[m]·h[k−m]`), which has length `N + Np − 1` and introduces a
-group delay of `Np − 1` samples — a target's compressed peak lands at
-`delay + (Np − 1)`, not at `delay`. The code corrects for this before
-converting bins to range. This is a common gotcha in matched-filter radar
-sims and worth understanding rather than just copying: if you switch to an
-FFT-based (frequency-domain) matched filter, the delay bookkeeping changes
-again depending on zero-padding and circular vs. linear convolution.
-
-## Parameters you can tune (`lfm_radar.c`, `main()`)
-
-| Parameter | Meaning | Current value |
+| Parameter | Meaning | Value |
 |---|---|---|
 | `fs` | Sample rate | 10 MHz |
 | `pulse_width` | Chirp duration `T` | 10 µs |
 | `bandwidth` | Chirp bandwidth `B` | 5 MHz → range resolution ≈ 30 m |
 | `n_samples` | Receive window length | 2048 |
 | `noise_power` | Noise variance | 0.6 |
-| `targets[]` | Range (m) / amplitude pairs | 4 targets incl. a close pair and a weak one |
+| `targets[]` | Range (m) / amplitude pairs | 4 targets, incl. a close pair and a weak one |
 | CFAR `guard`, `train`, `pfa` | Detector tuning | 4, 16, 1e-4 |
 
-## Ideas to extend it (good for a report / demo)
+## Where I'd take this next
 
-- **FFT-based matched filtering** — replace the O(N·Np) direct convolution
-  with FFT-based fast convolution; compare runtime and verify the peaks land
-  in the same place once you account for the delay difference above.
-- **ROC curve** — sweep `Pfa` and plot detection probability vs. false-alarm
-  rate across many noise realizations, to characterize the CFAR detector.
-- **OS-CFAR / GO-CFAR** — swap in Ordered-Statistic or Greatest-Of CFAR and
-  compare performance in multi-target / clutter-edge scenarios (CA-CFAR
-  degrades when a second target falls inside the training window — this is
-  a well-known weakness worth demonstrating).
-- **Doppler processing** — add per-pulse phase shift for moving targets and
-  build a simple range-Doppler map (multiple pulses → 2D FFT).
-- **Windowing** — apply a Taylor or Hamming window to the chirp/matched
-  filter to suppress range sidelobes, and show the before/after sidelobe
-  level in your report.
+- Swap the direct O(N·Np) convolution for an FFT-based matched filter and
+  compare runtime, once I re-derive the delay bookkeeping for that case.
+- Sweep `Pfa` across many noise realizations and plot a proper ROC curve
+  to characterize the detector.
+- Try OS-CFAR or GO-CFAR and show where CA-CFAR breaks down when a second
+  target lands inside the training window.
+- Add Doppler processing — per-pulse phase shift for moving targets and a
+  2D range-Doppler map.
+- Apply a window (Taylor/Hamming) to the chirp to suppress range
+  sidelobes, and compare before/after.
